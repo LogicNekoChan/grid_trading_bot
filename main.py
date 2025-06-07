@@ -1,51 +1,66 @@
+# main.py
 import time
 import pandas as pd
-from config import Config
+
+from config import *
 from binance_futures import BinanceFuturesClient
-from trend_detector import TrendDetector
-from fibo_calculator import FiboCalculator
+from trend_detector import detect_trend
+from fibo_calculator import calc_fibo_levels, find_high_low
 from grid_executor import GridExecutor
 from risk_manager import RiskManager
 
 def main():
-    cfg = Config()
-    client = BinanceFuturesClient(cfg.API_KEY, cfg.API_SECRET, cfg.SYMBOL, cfg.LEVERAGE, cfg.IS_ISOLATED)
-    trend_detector = TrendDetector(cfg.EMA_PERIODS)
-    fibo_calc = FiboCalculator(cfg.FIBO_LEVELS)
-    grid_executor = GridExecutor(client, cfg.MAX_LONG_POS, cfg.MAX_SHORT_POS)
-    risk_manager = RiskManager(cfg.MAX_TOTAL_POS, cfg.CAPITAL_USAGE_RATIO)
+    client = BinanceFuturesClient(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+    risk_manager = RiskManager(LONG_PARAMS['max_position'], SHORT_PARAMS['max_position'])
 
     while True:
-        klines_raw = client.get_klines('1d', 200)
-        # 转换为DataFrame，假设binance返回列表
-        klines = pd.DataFrame(klines_raw, columns=['open_time', 'open', 'high', 'low', 'close', 'volume',
-                                                  'close_time', 'quote_asset_volume', 'number_of_trades',
-                                                  'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-        klines['close'] = klines['close'].astype(float)
-        klines['high'] = klines['high'].astype(float)
-        klines['low'] = klines['low'].astype(float)
+        # 获取K线数据
+        raw_klines = client.get_klines(SYMBOL, '1d', limit=200)
+        df = pd.DataFrame(raw_klines, columns=['open_time','open','high','low','close','volume','close_time',
+                                               'quote_asset_volume','number_of_trades','taker_buy_base','taker_buy_quote','ignore'])
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
 
-        trend = trend_detector.detect_trend(klines)
+        # 趋势判断
+        trend = detect_trend(df)
 
-        low_price = klines['low'].min()
-        high_price = klines['high'].max()
-        grid_prices = fibo_calc.generate_grid_prices(low_price, high_price, cfg.GRID_NUM)
-
-        available_capital = client.get_account_balance()
-        quantity_per_order = 0.001  # 示例，后续可改为动态计算
-
-        if trend == "long":
-            # 做多网格策略
-            if risk_manager.check_risk(0, available_capital, grid_prices[0], quantity_per_order):
-                grid_executor.place_grid_orders(grid_prices, "LONG", quantity_per_order)
-        elif trend == "short":
-            # 做空网格策略
-            if risk_manager.check_risk(0, available_capital, grid_prices[-1], quantity_per_order):
-                grid_executor.place_grid_orders(grid_prices, "SHORT", quantity_per_order)
+        # 计算斐波那契区间
+        high, low = find_high_low(df['high'].tolist())
+        if trend == 'LONG':
+            fibo_levels = calc_fibo_levels(low, high, LONG_PARAMS['fibo_ratios'])
+            max_pos = LONG_PARAMS['max_position']
+        elif trend == 'SHORT':
+            fibo_levels = calc_fibo_levels(low, high, SHORT_PARAMS['fibo_ratios'])
+            max_pos = SHORT_PARAMS['max_position']
         else:
-            print("当前趋势中性，等待")
+            time.sleep(60)
+            continue
 
-        time.sleep(60)  # 每分钟运行一次
+        # 资金和仓位管理
+        balance_info = client.client.futures_account_balance()
+        usdt_balance = float([x['balance'] for x in balance_info if x['asset']=='USDT'][0])
+        current_position = client.get_position(SYMBOL)
+        current_pos_amt = float(current_position['positionAmt']) if current_position else 0
 
-if __name__ == '__main__':
+        if not risk_manager.check_position_limit(current_pos_amt, trend):
+            print("仓位达到上限，跳过本次操作")
+            time.sleep(60)
+            continue
+
+        qty_per_grid = risk_manager.calculate_order_quantity(
+            usdt_balance,
+            df['close'].iloc[-1],
+            LONG_PARAMS['leverage'],
+            TOTAL_CAPITAL_PCT,
+            max_pos
+        )
+
+        grid_executor = GridExecutor(client, SYMBOL, max_pos)
+        side = 'BUY' if trend == 'LONG' else 'SELL'
+        grid_executor.place_grid_orders(side, fibo_levels, qty_per_grid)
+
+        time.sleep(60)  # 1分钟周期循环
+
+if __name__ == "__main__":
     main()
